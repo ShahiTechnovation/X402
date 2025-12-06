@@ -11,17 +11,17 @@ describe("SessionManager", function () {
   let owner: SignerWithAddress;
   let operator: SignerWithAddress;
   let user: SignerWithAddress;
-  let feeRecipient: SignerWithAddress;
+  let treasury: SignerWithAddress;
 
   const INITIAL_SUPPLY = ethers.parseEther("1000000");
   const REGISTRATION_FEE = ethers.parseEther("10");
-  const PROTOCOL_FEE_PERCENT = 500;
-  const NODE_RATE = ethers.parseEther("10");
+  const PROTOCOL_FEE_BPS = 500;
+  const NODE_RATE_PER_MINUTE = ethers.parseEther("1");
 
   let nodeId: number;
 
   beforeEach(async function () {
-    [owner, operator, user, feeRecipient] = await ethers.getSigners();
+    [owner, operator, user, treasury] = await ethers.getSigners();
 
     const X402TokenFactory = await ethers.getContractFactory("X402Token");
     token = await X402TokenFactory.deploy("X402 Token", "X402", INITIAL_SUPPLY);
@@ -35,8 +35,8 @@ describe("SessionManager", function () {
     sessionManager = await SessionManagerFactory.deploy(
       await token.getAddress(),
       await registry.getAddress(),
-      feeRecipient.address,
-      PROTOCOL_FEE_PERCENT
+      treasury.address,
+      PROTOCOL_FEE_BPS
     );
     await sessionManager.waitForDeployment();
 
@@ -44,8 +44,12 @@ describe("SessionManager", function () {
     await token.transfer(user.address, ethers.parseEther("10000"));
 
     await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE);
-    const tx = await registry.connect(operator).registerNode("https://node1.example.com", NODE_RATE);
-    const receipt = await tx.wait();
+    await registry.connect(operator).registerNode(
+      "https://node1.example.com",
+      "us-east-1",
+      "ipfs://test",
+      NODE_RATE_PER_MINUTE
+    );
     nodeId = 0;
   });
 
@@ -53,8 +57,8 @@ describe("SessionManager", function () {
     it("Should set correct addresses and parameters", async function () {
       expect(await sessionManager.token()).to.equal(await token.getAddress());
       expect(await sessionManager.nodeRegistry()).to.equal(await registry.getAddress());
-      expect(await sessionManager.feeRecipient()).to.equal(feeRecipient.address);
-      expect(await sessionManager.protocolFeePercent()).to.equal(PROTOCOL_FEE_PERCENT);
+      expect(await sessionManager.treasury()).to.equal(treasury.address);
+      expect(await sessionManager.protocolFeeBps()).to.equal(PROTOCOL_FEE_BPS);
     });
 
     it("Should revert with invalid addresses", async function () {
@@ -64,28 +68,28 @@ describe("SessionManager", function () {
         SessionManagerFactory.deploy(
           ethers.ZeroAddress,
           await registry.getAddress(),
-          feeRecipient.address,
-          PROTOCOL_FEE_PERCENT
+          treasury.address,
+          PROTOCOL_FEE_BPS
         )
-      ).to.be.revertedWith("Invalid token");
+      ).to.be.revertedWithCustomError(sessionManager, "InvalidToken");
 
       await expect(
         SessionManagerFactory.deploy(
           await token.getAddress(),
           ethers.ZeroAddress,
-          feeRecipient.address,
-          PROTOCOL_FEE_PERCENT
+          treasury.address,
+          PROTOCOL_FEE_BPS
         )
-      ).to.be.revertedWith("Invalid registry");
+      ).to.be.revertedWithCustomError(sessionManager, "InvalidRegistry");
 
       await expect(
         SessionManagerFactory.deploy(
           await token.getAddress(),
           await registry.getAddress(),
           ethers.ZeroAddress,
-          PROTOCOL_FEE_PERCENT
+          PROTOCOL_FEE_BPS
         )
-      ).to.be.revertedWith("Invalid recipient");
+      ).to.be.revertedWithCustomError(sessionManager, "InvalidTreasury");
     });
 
     it("Should revert with fee too high", async function () {
@@ -95,10 +99,57 @@ describe("SessionManager", function () {
         SessionManagerFactory.deploy(
           await token.getAddress(),
           await registry.getAddress(),
-          feeRecipient.address,
+          treasury.address,
           10001
         )
-      ).to.be.revertedWith("Fee too high");
+      ).to.be.revertedWithCustomError(sessionManager, "InvalidFeeBps");
+    });
+  });
+
+  describe("Deposit and Withdraw", function () {
+    it("Should deposit tokens successfully", async function () {
+      const depositAmount = ethers.parseEther("100");
+      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
+
+      await expect(sessionManager.connect(user).deposit(depositAmount))
+        .to.emit(sessionManager, "Deposited")
+        .withArgs(user.address, depositAmount);
+
+      expect(await sessionManager.getUserBalance(user.address)).to.equal(depositAmount);
+    });
+
+    it("Should withdraw tokens successfully", async function () {
+      const depositAmount = ethers.parseEther("100");
+      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
+      await sessionManager.connect(user).deposit(depositAmount);
+
+      const balanceBefore = await token.balanceOf(user.address);
+      
+      await expect(sessionManager.connect(user).withdraw(depositAmount))
+        .to.emit(sessionManager, "Withdrawn")
+        .withArgs(user.address, depositAmount);
+
+      const balanceAfter = await token.balanceOf(user.address);
+      expect(balanceAfter).to.equal(balanceBefore + depositAmount);
+      expect(await sessionManager.getUserBalance(user.address)).to.equal(0);
+    });
+
+    it("Should revert deposit with zero amount", async function () {
+      await expect(
+        sessionManager.connect(user).deposit(0)
+      ).to.be.revertedWithCustomError(sessionManager, "InvalidAmount");
+    });
+
+    it("Should revert withdraw with zero amount", async function () {
+      await expect(
+        sessionManager.connect(user).withdraw(0)
+      ).to.be.revertedWithCustomError(sessionManager, "InvalidAmount");
+    });
+
+    it("Should revert withdraw with insufficient balance", async function () {
+      await expect(
+        sessionManager.connect(user).withdraw(ethers.parseEther("100"))
+      ).to.be.revertedWithCustomError(sessionManager, "InsufficientBalance");
     });
   });
 
@@ -106,9 +157,12 @@ describe("SessionManager", function () {
     const depositAmount = ethers.parseEther("100");
     const maxSpend = ethers.parseEther("100");
 
-    it("Should start a session successfully", async function () {
+    beforeEach(async function () {
       await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
+      await sessionManager.connect(user).deposit(depositAmount);
+    });
 
+    it("Should start a session successfully", async function () {
       const tx = await sessionManager.connect(user).startSession(nodeId, maxSpend, depositAmount);
       const receipt = await tx.wait();
 
@@ -121,10 +175,10 @@ describe("SessionManager", function () {
       });
 
       expect(events?.length).to.be.greaterThan(0);
+      expect(await sessionManager.getUserBalance(user.address)).to.equal(0);
     });
 
     it("Should settle a session", async function () {
-      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
       const tx = await sessionManager.connect(user).startSession(nodeId, maxSpend, depositAmount);
       const receipt = await tx.wait();
 
@@ -139,17 +193,16 @@ describe("SessionManager", function () {
         } catch {}
       }
 
-      await time.increase(3600);
+      await time.increase(60);
 
-      await expect(sessionManager.settleSession(sessionId))
+      await expect(sessionManager.settle(sessionId))
         .to.emit(sessionManager, "SessionSettled");
 
-      const session = await sessionManager.getSession(sessionId);
+      const session = await sessionManager.getSessionStatus(sessionId);
       expect(session.settled).to.be.greaterThan(0);
     });
 
     it("Should stop a session and refund remaining balance", async function () {
-      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
       const tx = await sessionManager.connect(user).startSession(nodeId, maxSpend, depositAmount);
       const receipt = await tx.wait();
 
@@ -164,7 +217,7 @@ describe("SessionManager", function () {
         } catch {}
       }
 
-      await time.increase(1800);
+      await time.increase(60);
 
       const userBalanceBefore = await token.balanceOf(user.address);
       await sessionManager.connect(user).stopSession(sessionId);
@@ -172,12 +225,11 @@ describe("SessionManager", function () {
 
       expect(userBalanceAfter).to.be.greaterThan(userBalanceBefore);
 
-      const session = await sessionManager.getSession(sessionId);
+      const session = await sessionManager.getSessionStatus(sessionId);
       expect(session.active).to.be.false;
     });
 
     it("Should handle multiple settle calls", async function () {
-      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
       const tx = await sessionManager.connect(user).startSession(nodeId, maxSpend, depositAmount);
       const receipt = await tx.wait();
 
@@ -192,48 +244,56 @@ describe("SessionManager", function () {
         } catch {}
       }
 
-      await time.increase(1800);
-      await sessionManager.settleSession(sessionId);
+      await time.increase(60);
+      await sessionManager.settle(sessionId);
 
-      const session1 = await sessionManager.getSession(sessionId);
+      const session1 = await sessionManager.getSessionStatus(sessionId);
       const settled1 = session1.settled;
 
-      await time.increase(1800);
-      await sessionManager.settleSession(sessionId);
+      await time.increase(60);
+      await sessionManager.settle(sessionId);
 
-      const session2 = await sessionManager.getSession(sessionId);
+      const session2 = await sessionManager.getSessionStatus(sessionId);
       expect(session2.settled).to.be.greaterThan(settled1);
     });
   });
 
   describe("Session Validation", function () {
+    beforeEach(async function () {
+      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
+      await sessionManager.connect(user).deposit(ethers.parseEther("100"));
+    });
+
     it("Should revert if node is inactive", async function () {
       await registry.connect(operator).deactivateNode(nodeId);
 
-      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
       await expect(
         sessionManager.connect(user).startSession(nodeId, ethers.parseEther("100"), ethers.parseEther("100"))
-      ).to.be.revertedWith("Node inactive");
+      ).to.be.revertedWithCustomError(sessionManager, "NodeInactive");
     });
 
     it("Should revert if deposit is zero", async function () {
       await expect(
         sessionManager.connect(user).startSession(nodeId, ethers.parseEther("100"), 0)
-      ).to.be.revertedWith("Deposit required");
+      ).to.be.revertedWithCustomError(sessionManager, "InvalidAmount");
     });
 
     it("Should revert if maxSpend is less than deposit", async function () {
       const deposit = ethers.parseEther("100");
       const maxSpend = ethers.parseEther("50");
 
-      await token.connect(user).approve(await sessionManager.getAddress(), deposit);
       await expect(
         sessionManager.connect(user).startSession(nodeId, maxSpend, deposit)
-      ).to.be.revertedWith("maxSpend < deposit");
+      ).to.be.revertedWithCustomError(sessionManager, "MaxSpendTooLow");
+    });
+
+    it("Should revert if insufficient user balance", async function () {
+      await expect(
+        sessionManager.connect(user).startSession(nodeId, ethers.parseEther("200"), ethers.parseEther("200"))
+      ).to.be.revertedWithCustomError(sessionManager, "InsufficientBalance");
     });
 
     it("Should revert settle if session not active", async function () {
-      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
       const tx = await sessionManager.connect(user).startSession(nodeId, ethers.parseEther("100"), ethers.parseEther("100"));
       const receipt = await tx.wait();
 
@@ -248,12 +308,12 @@ describe("SessionManager", function () {
         } catch {}
       }
 
-      await time.increase(1800);
+      await time.increase(60);
       await sessionManager.connect(user).stopSession(sessionId);
 
       await expect(
-        sessionManager.settleSession(sessionId)
-      ).to.be.revertedWith("Session inactive");
+        sessionManager.settle(sessionId)
+      ).to.be.revertedWithCustomError(sessionManager, "SessionInactive");
     });
   });
 
@@ -263,6 +323,8 @@ describe("SessionManager", function () {
       const maxSpend = ethers.parseEther("100");
 
       await token.connect(user).approve(await sessionManager.getAddress(), smallDeposit);
+      await sessionManager.connect(user).deposit(smallDeposit);
+
       const tx = await sessionManager.connect(user).startSession(nodeId, maxSpend, smallDeposit);
       const receipt = await tx.wait();
 
@@ -277,41 +339,13 @@ describe("SessionManager", function () {
         } catch {}
       }
 
-      await time.increase(3600);
+      await time.increase(600);
 
-      await sessionManager.settleSession(sessionId);
+      await sessionManager.settle(sessionId);
 
-      const session = await sessionManager.getSession(sessionId);
+      const session = await sessionManager.getSessionStatus(sessionId);
       expect(session.settled).to.equal(smallDeposit);
       expect(session.active).to.be.false;
-    });
-
-    it("Should force stop session with insufficient balance", async function () {
-      const smallDeposit = ethers.parseEther("5");
-      const maxSpend = ethers.parseEther("100");
-
-      await token.connect(user).approve(await sessionManager.getAddress(), smallDeposit);
-      const tx = await sessionManager.connect(user).startSession(nodeId, maxSpend, smallDeposit);
-      const receipt = await tx.wait();
-
-      let sessionId: string = "";
-      for (const log of receipt!.logs) {
-        try {
-          const parsed = sessionManager.interface.parseLog(log as any);
-          if (parsed?.name === "SessionStarted") {
-            sessionId = parsed.args[0];
-            break;
-          }
-        } catch {}
-      }
-
-      await time.increase(3600);
-
-      await sessionManager.connect(owner).forceStopSession(sessionId);
-
-      const session = await sessionManager.getSession(sessionId);
-      expect(session.active).to.be.false;
-      expect(session.settled).to.equal(smallDeposit);
     });
   });
 
@@ -321,34 +355,8 @@ describe("SessionManager", function () {
       const maxSpend = ethers.parseEther("10");
 
       await token.connect(user).approve(await sessionManager.getAddress(), deposit);
-      const tx = await sessionManager.connect(user).startSession(nodeId, maxSpend, deposit);
-      const receipt = await tx.wait();
+      await sessionManager.connect(user).deposit(deposit);
 
-      let sessionId: string = "";
-      for (const log of receipt!.logs) {
-        try {
-          const parsed = sessionManager.interface.parseLog(log as any);
-          if (parsed?.name === "SessionStarted") {
-            sessionId = parsed.args[0];
-            break;
-          }
-        } catch {}
-      }
-
-      await time.increase(3600);
-
-      await sessionManager.settleSession(sessionId);
-
-      const session = await sessionManager.getSession(sessionId);
-      expect(session.settled).to.equal(maxSpend);
-      expect(session.active).to.be.false;
-    });
-
-    it("Should refund excess deposit when maxSpend limits settlement", async function () {
-      const deposit = ethers.parseEther("10");
-      const maxSpend = ethers.parseEther("50");
-
-      await token.connect(user).approve(await sessionManager.getAddress(), deposit);
       const tx = await sessionManager.connect(user).startSession(nodeId, maxSpend, deposit);
       const receipt = await tx.wait();
 
@@ -365,13 +373,11 @@ describe("SessionManager", function () {
 
       await time.increase(600);
 
-      const userBalanceBefore = await token.balanceOf(user.address);
-      await sessionManager.connect(user).stopSession(sessionId);
-      const userBalanceAfter = await token.balanceOf(user.address);
+      await sessionManager.settle(sessionId);
 
-      const refund = userBalanceAfter - userBalanceBefore;
-      expect(refund).to.be.greaterThan(0);
-      expect(refund).to.be.lessThan(deposit);
+      const session = await sessionManager.getSessionStatus(sessionId);
+      expect(session.settled).to.equal(maxSpend);
+      expect(session.active).to.be.false;
     });
   });
 
@@ -381,6 +387,8 @@ describe("SessionManager", function () {
       const maxSpend = ethers.parseEther("100");
 
       await token.connect(user).approve(await sessionManager.getAddress(), deposit);
+      await sessionManager.connect(user).deposit(deposit);
+
       const tx = await sessionManager.connect(user).startSession(nodeId, maxSpend, deposit);
       const receipt = await tx.wait();
 
@@ -395,8 +403,8 @@ describe("SessionManager", function () {
         } catch {}
       }
 
-      await time.increase(3600);
-      await sessionManager.settleSession(sessionId);
+      await time.increase(60);
+      await sessionManager.settle(sessionId);
 
       const totalFees = await sessionManager.totalProtocolFees();
       expect(totalFees).to.be.greaterThan(0);
@@ -406,6 +414,8 @@ describe("SessionManager", function () {
       const deposit = ethers.parseEther("100");
 
       await token.connect(user).approve(await sessionManager.getAddress(), deposit);
+      await sessionManager.connect(user).deposit(deposit);
+
       const tx = await sessionManager.connect(user).startSession(nodeId, deposit, deposit);
       const receipt = await tx.wait();
 
@@ -420,12 +430,12 @@ describe("SessionManager", function () {
         } catch {}
       }
 
-      await time.increase(3600);
-      await sessionManager.settleSession(sessionId);
+      await time.increase(60);
+      await sessionManager.settle(sessionId);
 
-      const balanceBefore = await token.balanceOf(feeRecipient.address);
+      const balanceBefore = await token.balanceOf(treasury.address);
       await sessionManager.withdrawProtocolFees();
-      const balanceAfter = await token.balanceOf(feeRecipient.address);
+      const balanceAfter = await token.balanceOf(treasury.address);
 
       expect(balanceAfter).to.be.greaterThan(balanceBefore);
     });
@@ -442,6 +452,8 @@ describe("SessionManager", function () {
       const deposit = ethers.parseEther("100");
 
       await token.connect(user).approve(await sessionManager.getAddress(), deposit);
+      await sessionManager.connect(user).deposit(deposit);
+
       const tx = await sessionManager.connect(user).startSession(nodeId, deposit, deposit);
       const receipt = await tx.wait();
 
@@ -456,17 +468,19 @@ describe("SessionManager", function () {
         } catch {}
       }
 
-      await time.increase(3600);
-      await sessionManager.settleSession(sessionId);
+      await time.increase(60);
+      await sessionManager.settle(sessionId);
 
-      const node = await registry.getNode(nodeId);
-      expect(node.earnings).to.be.greaterThan(0);
+      const earnings = await sessionManager.getNodeEarnings(nodeId);
+      expect(earnings).to.be.greaterThan(0);
     });
 
     it("Should allow node operator to claim earnings", async function () {
       const deposit = ethers.parseEther("100");
 
       await token.connect(user).approve(await sessionManager.getAddress(), deposit);
+      await sessionManager.connect(user).deposit(deposit);
+
       const tx = await sessionManager.connect(user).startSession(nodeId, deposit, deposit);
       const receipt = await tx.wait();
 
@@ -481,8 +495,8 @@ describe("SessionManager", function () {
         } catch {}
       }
 
-      await time.increase(3600);
-      await sessionManager.settleSession(sessionId);
+      await time.increase(60);
+      await sessionManager.settle(sessionId);
 
       const balanceBefore = await token.balanceOf(operator.address);
       await registry.connect(operator).claimEarnings(nodeId);
@@ -492,11 +506,21 @@ describe("SessionManager", function () {
     });
   });
 
-  describe("Reentrancy Protection", function () {
-    it("Should protect stopSession from reentrancy", async function () {
+  describe("View Functions", function () {
+    it("Should get user balance", async function () {
+      const depositAmount = ethers.parseEther("100");
+      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
+      await sessionManager.connect(user).deposit(depositAmount);
+
+      expect(await sessionManager.getUserBalance(user.address)).to.equal(depositAmount);
+    });
+
+    it("Should get node earnings", async function () {
       const deposit = ethers.parseEther("100");
 
       await token.connect(user).approve(await sessionManager.getAddress(), deposit);
+      await sessionManager.connect(user).deposit(deposit);
+
       const tx = await sessionManager.connect(user).startSession(nodeId, deposit, deposit);
       const receipt = await tx.wait();
 
@@ -511,184 +535,99 @@ describe("SessionManager", function () {
         } catch {}
       }
 
-      await time.increase(1800);
-      await sessionManager.connect(user).stopSession(sessionId);
+      await time.increase(60);
+      await sessionManager.settle(sessionId);
 
-      const session = await sessionManager.getSession(sessionId);
-      expect(session.active).to.be.false;
+      const earnings = await sessionManager.getNodeEarnings(nodeId);
+      expect(earnings).to.be.greaterThan(0);
+    });
+
+    it("Should get session status", async function () {
+      const deposit = ethers.parseEther("100");
+
+      await token.connect(user).approve(await sessionManager.getAddress(), deposit);
+      await sessionManager.connect(user).deposit(deposit);
+
+      const tx = await sessionManager.connect(user).startSession(nodeId, deposit, deposit);
+      const receipt = await tx.wait();
+
+      let sessionId: string = "";
+      for (const log of receipt!.logs) {
+        try {
+          const parsed = sessionManager.interface.parseLog(log as any);
+          if (parsed?.name === "SessionStarted") {
+            sessionId = parsed.args[0];
+            break;
+          }
+        } catch {}
+      }
+
+      const session = await sessionManager.getSessionStatus(sessionId);
+      expect(session.user).to.equal(user.address);
+      expect(session.nodeId).to.equal(nodeId);
+      expect(session.active).to.be.true;
+    });
+
+    it("Should revert on invalid session", async function () {
+      const fakeSessionId = ethers.keccak256(ethers.toUtf8Bytes("fake"));
+      await expect(
+        sessionManager.getSessionStatus(fakeSessionId)
+      ).to.be.revertedWithCustomError(sessionManager, "InvalidSession");
     });
   });
 
   describe("Pausable", function () {
     it("Should pause and unpause", async function () {
       await sessionManager.pause();
-
+      
       await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
       await expect(
-        sessionManager.connect(user).startSession(nodeId, ethers.parseEther("100"), ethers.parseEther("100"))
+        sessionManager.connect(user).deposit(ethers.parseEther("100"))
       ).to.be.revertedWithCustomError(sessionManager, "EnforcedPause");
 
       await sessionManager.unpause();
-
+      
       await expect(
-        sessionManager.connect(user).startSession(nodeId, ethers.parseEther("100"), ethers.parseEther("100"))
+        sessionManager.connect(user).deposit(ethers.parseEther("100"))
       ).to.not.be.reverted;
     });
-  });
 
-  describe("Fee Management", function () {
-    it("Should allow owner to update fee recipient", async function () {
-      const newRecipient = user.address;
-
-      await expect(sessionManager.setFeeRecipient(newRecipient))
-        .to.emit(sessionManager, "FeeRecipientUpdated")
-        .withArgs(newRecipient);
-
-      expect(await sessionManager.feeRecipient()).to.equal(newRecipient);
-    });
-
-    it("Should allow owner to update protocol fee percent", async function () {
-      const newFeePercent = 1000;
-
-      await expect(sessionManager.setProtocolFeePercent(newFeePercent))
-        .to.emit(sessionManager, "ProtocolFeeUpdated")
-        .withArgs(newFeePercent);
-
-      expect(await sessionManager.protocolFeePercent()).to.equal(newFeePercent);
-    });
-
-    it("Should revert if fee recipient is zero address", async function () {
+    it("Should only allow owner to pause", async function () {
       await expect(
-        sessionManager.setFeeRecipient(ethers.ZeroAddress)
-      ).to.be.revertedWith("Invalid recipient");
-    });
-
-    it("Should revert if fee percent is too high", async function () {
-      await expect(
-        sessionManager.setProtocolFeePercent(10001)
-      ).to.be.revertedWith("Fee too high");
-    });
-  });
-
-  describe("Getters", function () {
-    it("Should return user sessions", async function () {
-      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
-      await sessionManager.connect(user).startSession(nodeId, ethers.parseEther("100"), ethers.parseEther("100"));
-
-      const sessions = await sessionManager.getUserSessions(user.address);
-      expect(sessions.length).to.equal(1);
-    });
-
-    it("Should return node sessions", async function () {
-      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
-      await sessionManager.connect(user).startSession(nodeId, ethers.parseEther("100"), ethers.parseEther("100"));
-
-      const sessions = await sessionManager.getNodeSessions(nodeId);
-      expect(sessions.length).to.equal(1);
-    });
-  });
-
-  describe("Authorization", function () {
-    it("Should allow owner to force stop session", async function () {
-      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
-      const tx = await sessionManager.connect(user).startSession(nodeId, ethers.parseEther("100"), ethers.parseEther("100"));
-      const receipt = await tx.wait();
-
-      let sessionId: string = "";
-      for (const log of receipt!.logs) {
-        try {
-          const parsed = sessionManager.interface.parseLog(log as any);
-          if (parsed?.name === "SessionStarted") {
-            sessionId = parsed.args[0];
-            break;
-          }
-        } catch {}
-      }
-
-      await time.increase(1800);
-      await expect(sessionManager.connect(owner).forceStopSession(sessionId))
-        .to.not.be.reverted;
-    });
-
-    it("Should not allow non-owner to force stop", async function () {
-      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
-      const tx = await sessionManager.connect(user).startSession(nodeId, ethers.parseEther("100"), ethers.parseEther("100"));
-      const receipt = await tx.wait();
-
-      let sessionId: string = "";
-      for (const log of receipt!.logs) {
-        try {
-          const parsed = sessionManager.interface.parseLog(log as any);
-          if (parsed?.name === "SessionStarted") {
-            sessionId = parsed.args[0];
-            break;
-          }
-        } catch {}
-      }
-
-      await expect(
-        sessionManager.connect(operator).forceStopSession(sessionId)
+        sessionManager.connect(user).pause()
       ).to.be.revertedWithCustomError(sessionManager, "OwnableUnauthorizedAccount");
     });
   });
 
-  describe("Rate and Time Rounding", function () {
-    it("Should handle small time intervals correctly", async function () {
-      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
-      const tx = await sessionManager.connect(user).startSession(nodeId, ethers.parseEther("100"), ethers.parseEther("100"));
-      const receipt = await tx.wait();
+  describe("Admin Functions", function () {
+    it("Should update treasury address", async function () {
+      const newTreasury = user.address;
+      await expect(sessionManager.setTreasury(newTreasury))
+        .to.emit(sessionManager, "TreasuryUpdated")
+        .withArgs(newTreasury);
 
-      let sessionId: string = "";
-      for (const log of receipt!.logs) {
-        try {
-          const parsed = sessionManager.interface.parseLog(log as any);
-          if (parsed?.name === "SessionStarted") {
-            sessionId = parsed.args[0];
-            break;
-          }
-        } catch {}
-      }
-
-      await time.increase(10);
-      await sessionManager.settleSession(sessionId);
-
-      const session = await sessionManager.getSession(sessionId);
-      expect(session.settled).to.be.greaterThanOrEqual(0);
+      expect(await sessionManager.treasury()).to.equal(newTreasury);
     });
 
-    it("Should calculate cost correctly for various rates", async function () {
-      const rates = [
-        ethers.parseEther("1"),
-        ethers.parseEther("10"),
-        ethers.parseEther("100"),
-        ethers.parseEther("0.5")
-      ];
+    it("Should not allow setting zero address as treasury", async function () {
+      await expect(
+        sessionManager.setTreasury(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(sessionManager, "InvalidTreasury");
+    });
 
-      for (let i = 0; i < rates.length; i++) {
-        await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE);
-        await registry.connect(operator).registerNode(`https://node${i+2}.example.com`, rates[i]);
+    it("Should update protocol fee bps", async function () {
+      const newFeeBps = 1000;
+      await expect(sessionManager.setProtocolFeeBps(newFeeBps))
+        .to.emit(sessionManager, "ProtocolFeeBpsUpdated")
+        .withArgs(newFeeBps);
 
-        await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
-        const tx = await sessionManager.connect(user).startSession(i + 1, ethers.parseEther("100"), ethers.parseEther("100"));
-        const receipt = await tx.wait();
+      expect(await sessionManager.protocolFeeBps()).to.equal(newFeeBps);
+    });
 
-        let sessionId: string = "";
-        for (const log of receipt!.logs) {
-          try {
-            const parsed = sessionManager.interface.parseLog(log as any);
-            if (parsed?.name === "SessionStarted") {
-              sessionId = parsed.args[0];
-              break;
-            }
-          } catch {}
-        }
-
-        await time.increase(3600);
-        await sessionManager.settleSession(sessionId);
-
-        const session = await sessionManager.getSession(sessionId);
-        expect(session.settled).to.be.greaterThan(0);
-      }
+    it("Should not allow protocol fee bps over 10000", async function () {
+      await expect(
+        sessionManager.setProtocolFeeBps(10001)
+      ).to.be.revertedWithCustomError(sessionManager, "InvalidFeeBps");
     });
   });
 });

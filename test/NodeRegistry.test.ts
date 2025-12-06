@@ -47,22 +47,26 @@ describe("NodeRegistry", function () {
       await token.connect(operator1).approve(await registry.getAddress(), REGISTRATION_FEE);
       
       const endpoint = "https://node1.example.com";
-      const rate = ethers.parseEther("10");
+      const region = "us-east-1";
+      const metadataURI = "ipfs://QmTest123";
+      const ratePerMinute = ethers.parseEther("10");
 
-      await expect(registry.connect(operator1).registerNode(endpoint, rate))
+      await expect(registry.connect(operator1).registerNode(endpoint, region, metadataURI, ratePerMinute))
         .to.emit(registry, "NodeRegistered")
-        .withArgs(0, operator1.address, endpoint, rate);
+        .withArgs(0, operator1.address, endpoint, region, metadataURI, ratePerMinute);
 
       const node = await registry.getNode(0);
       expect(node.operator).to.equal(operator1.address);
       expect(node.endpoint).to.equal(endpoint);
-      expect(node.rate).to.equal(rate);
+      expect(node.region).to.equal(region);
+      expect(node.metadataURI).to.equal(metadataURI);
+      expect(node.ratePerMinute).to.equal(ratePerMinute);
       expect(node.active).to.be.true;
     });
 
     it("Should increment node count", async function () {
       await token.connect(operator1).approve(await registry.getAddress(), REGISTRATION_FEE);
-      await registry.connect(operator1).registerNode("https://node1.example.com", ethers.parseEther("10"));
+      await registry.connect(operator1).registerNode("https://node1.example.com", "us-east-1", "ipfs://test", ethers.parseEther("10"));
 
       expect(await registry.nodeCount()).to.equal(1);
     });
@@ -70,27 +74,27 @@ describe("NodeRegistry", function () {
     it("Should fail with empty endpoint", async function () {
       await token.connect(operator1).approve(await registry.getAddress(), REGISTRATION_FEE);
       await expect(
-        registry.connect(operator1).registerNode("", ethers.parseEther("10"))
-      ).to.be.revertedWith("Empty endpoint");
+        registry.connect(operator1).registerNode("", "us-east-1", "ipfs://test", ethers.parseEther("10"))
+      ).to.be.revertedWithCustomError(registry, "InvalidEndpoint");
     });
 
     it("Should fail with zero rate", async function () {
       await token.connect(operator1).approve(await registry.getAddress(), REGISTRATION_FEE);
       await expect(
-        registry.connect(operator1).registerNode("https://node1.example.com", 0)
-      ).to.be.revertedWith("Rate must be positive");
+        registry.connect(operator1).registerNode("https://node1.example.com", "us-east-1", "ipfs://test", 0)
+      ).to.be.revertedWithCustomError(registry, "InvalidRate");
     });
 
     it("Should fail without sufficient allowance", async function () {
       await expect(
-        registry.connect(operator1).registerNode("https://node1.example.com", ethers.parseEther("10"))
+        registry.connect(operator1).registerNode("https://node1.example.com", "us-east-1", "ipfs://test", ethers.parseEther("10"))
       ).to.be.revertedWithCustomError(token, "ERC20InsufficientAllowance");
     });
 
     it("Should track operator nodes", async function () {
       await token.connect(operator1).approve(await registry.getAddress(), REGISTRATION_FEE * 2n);
-      await registry.connect(operator1).registerNode("https://node1.example.com", ethers.parseEther("10"));
-      await registry.connect(operator1).registerNode("https://node2.example.com", ethers.parseEther("15"));
+      await registry.connect(operator1).registerNode("https://node1.example.com", "us-east-1", "ipfs://test1", ethers.parseEther("10"));
+      await registry.connect(operator1).registerNode("https://node2.example.com", "us-west-1", "ipfs://test2", ethers.parseEther("15"));
 
       const operatorNodes = await registry.getOperatorNodes(operator1.address);
       expect(operatorNodes.length).to.equal(2);
@@ -102,45 +106,49 @@ describe("NodeRegistry", function () {
   describe("Node Updates", function () {
     beforeEach(async function () {
       await token.connect(operator1).approve(await registry.getAddress(), REGISTRATION_FEE);
-      await registry.connect(operator1).registerNode("https://node1.example.com", ethers.parseEther("10"));
+      await registry.connect(operator1).registerNode("https://node1.example.com", "us-east-1", "ipfs://test", ethers.parseEther("10"));
     });
 
-    it("Should update node endpoint and rate", async function () {
+    it("Should update node endpoint, region, metadata, and rate", async function () {
       const newEndpoint = "https://node1-updated.example.com";
+      const newRegion = "eu-west-1";
+      const newMetadataURI = "ipfs://QmUpdated456";
       const newRate = ethers.parseEther("20");
 
-      await expect(registry.connect(operator1).updateNode(0, newEndpoint, newRate))
+      await expect(registry.connect(operator1).updateNode(0, newEndpoint, newRegion, newMetadataURI, newRate))
         .to.emit(registry, "NodeUpdated")
-        .withArgs(0, newEndpoint, newRate);
+        .withArgs(0, newEndpoint, newRegion, newMetadataURI, newRate);
 
       const node = await registry.getNode(0);
       expect(node.endpoint).to.equal(newEndpoint);
-      expect(node.rate).to.equal(newRate);
+      expect(node.region).to.equal(newRegion);
+      expect(node.metadataURI).to.equal(newMetadataURI);
+      expect(node.ratePerMinute).to.equal(newRate);
     });
 
     it("Should fail if not operator", async function () {
       await expect(
-        registry.connect(operator2).updateNode(0, "https://test.com", ethers.parseEther("20"))
-      ).to.be.revertedWith("Not operator");
+        registry.connect(operator2).updateNode(0, "https://test.com", "us-east-1", "ipfs://test", ethers.parseEther("20"))
+      ).to.be.revertedWithCustomError(registry, "NotOperator");
     });
 
     it("Should fail with empty endpoint", async function () {
       await expect(
-        registry.connect(operator1).updateNode(0, "", ethers.parseEther("20"))
-      ).to.be.revertedWith("Empty endpoint");
+        registry.connect(operator1).updateNode(0, "", "us-east-1", "ipfs://test", ethers.parseEther("20"))
+      ).to.be.revertedWithCustomError(registry, "InvalidEndpoint");
     });
 
     it("Should fail with zero rate", async function () {
       await expect(
-        registry.connect(operator1).updateNode(0, "https://test.com", 0)
-      ).to.be.revertedWith("Rate must be positive");
+        registry.connect(operator1).updateNode(0, "https://test.com", "us-east-1", "ipfs://test", 0)
+      ).to.be.revertedWithCustomError(registry, "InvalidRate");
     });
   });
 
   describe("Node Deactivation", function () {
     beforeEach(async function () {
       await token.connect(operator1).approve(await registry.getAddress(), REGISTRATION_FEE);
-      await registry.connect(operator1).registerNode("https://node1.example.com", ethers.parseEther("10"));
+      await registry.connect(operator1).registerNode("https://node1.example.com", "us-east-1", "ipfs://test", ethers.parseEther("10"));
     });
 
     it("Should deactivate a node", async function () {
@@ -155,14 +163,14 @@ describe("NodeRegistry", function () {
     it("Should fail if not operator", async function () {
       await expect(
         registry.connect(operator2).deactivateNode(0)
-      ).to.be.revertedWith("Not operator");
+      ).to.be.revertedWithCustomError(registry, "NotOperator");
     });
 
     it("Should fail if already inactive", async function () {
       await registry.connect(operator1).deactivateNode(0);
       await expect(
         registry.connect(operator1).deactivateNode(0)
-      ).to.be.revertedWith("Already inactive");
+      ).to.be.revertedWithCustomError(registry, "AlreadyInactive");
     });
 
     it("Should reactivate a node", async function () {
@@ -180,7 +188,7 @@ describe("NodeRegistry", function () {
   describe("Earnings Management", function () {
     beforeEach(async function () {
       await token.connect(operator1).approve(await registry.getAddress(), REGISTRATION_FEE);
-      await registry.connect(operator1).registerNode("https://node1.example.com", ethers.parseEther("10"));
+      await registry.connect(operator1).registerNode("https://node1.example.com", "us-east-1", "ipfs://test", ethers.parseEther("10"));
     });
 
     it("Should add earnings to a node", async function () {
@@ -216,13 +224,13 @@ describe("NodeRegistry", function () {
 
       await expect(
         registry.connect(operator2).claimEarnings(0)
-      ).to.be.revertedWith("Not operator");
+      ).to.be.revertedWithCustomError(registry, "NotOperator");
     });
 
     it("Should fail to claim with no earnings", async function () {
       await expect(
         registry.connect(operator1).claimEarnings(0)
-      ).to.be.revertedWith("No earnings");
+      ).to.be.revertedWithCustomError(registry, "NoEarnings");
     });
 
     it("Should prevent reentrancy on claim", async function () {
@@ -240,13 +248,13 @@ describe("NodeRegistry", function () {
       
       await token.connect(operator1).approve(await registry.getAddress(), REGISTRATION_FEE);
       await expect(
-        registry.connect(operator1).registerNode("https://node1.example.com", ethers.parseEther("10"))
+        registry.connect(operator1).registerNode("https://node1.example.com", "us-east-1", "ipfs://test", ethers.parseEther("10"))
       ).to.be.revertedWithCustomError(registry, "EnforcedPause");
 
       await registry.unpause();
       
       await expect(
-        registry.connect(operator1).registerNode("https://node1.example.com", ethers.parseEther("10"))
+        registry.connect(operator1).registerNode("https://node1.example.com", "us-east-1", "ipfs://test", ethers.parseEther("10"))
       ).to.not.be.reverted;
     });
 
@@ -277,7 +285,7 @@ describe("NodeRegistry", function () {
 
   describe("Getters", function () {
     it("Should fail to get invalid node", async function () {
-      await expect(registry.getNode(999)).to.be.revertedWith("Invalid node");
+      await expect(registry.getNode(999)).to.be.revertedWithCustomError(registry, "InvalidNode");
     });
 
     it("Should return empty array for operator with no nodes", async function () {

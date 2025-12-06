@@ -18,9 +18,9 @@ async function main() {
     ? ethers.parseEther(process.env.REGISTRATION_FEE)
     : ethers.parseEther("10");
   
-  const feeRecipient = process.env.FEE_RECIPIENT || deployer.address;
-  const protocolFeePercent = process.env.PROTOCOL_FEE_PERCENT
-    ? parseInt(process.env.PROTOCOL_FEE_PERCENT)
+  const treasury = process.env.TREASURY || deployer.address;
+  const protocolFeeBps = process.env.PROTOCOL_FEE_BPS
+    ? parseInt(process.env.PROTOCOL_FEE_BPS)
     : 500;
 
   console.log("\n=== Deployment Parameters ===");
@@ -28,8 +28,8 @@ async function main() {
   console.log("Token Symbol:", tokenSymbol);
   console.log("Initial Supply:", ethers.formatEther(initialSupply));
   console.log("Registration Fee:", ethers.formatEther(registrationFee));
-  console.log("Fee Recipient:", feeRecipient);
-  console.log("Protocol Fee Percent:", protocolFeePercent, "(", protocolFeePercent / 100, "%)");
+  console.log("Treasury:", treasury);
+  console.log("Protocol Fee (bps):", protocolFeeBps, "(", protocolFeeBps / 100, "%)");
 
   console.log("\n=== Deploying X402Token ===");
   const X402TokenFactory = await ethers.getContractFactory("X402Token");
@@ -50,8 +50,8 @@ async function main() {
   const sessionManager = await SessionManagerFactory.deploy(
     tokenAddress,
     registryAddress,
-    feeRecipient,
-    protocolFeePercent
+    treasury,
+    protocolFeeBps
   );
   await sessionManager.waitForDeployment();
   const sessionManagerAddress = await sessionManager.getAddress();
@@ -73,7 +73,7 @@ async function main() {
       },
       SessionManager: {
         address: sessionManagerAddress,
-        args: [tokenAddress, registryAddress, feeRecipient, protocolFeePercent],
+        args: [tokenAddress, registryAddress, treasury, protocolFeeBps],
       },
     },
     configuration: {
@@ -81,8 +81,8 @@ async function main() {
       tokenSymbol,
       initialSupply: ethers.formatEther(initialSupply),
       registrationFee: ethers.formatEther(registrationFee),
-      feeRecipient,
-      protocolFeePercent,
+      treasury,
+      protocolFeeBps,
     },
   };
 

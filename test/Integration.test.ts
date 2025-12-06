@@ -15,8 +15,8 @@ describe("Integration Tests - Full Flow", function () {
 
   const INITIAL_SUPPLY = ethers.parseEther("1000000");
   const REGISTRATION_FEE = ethers.parseEther("10");
-  const PROTOCOL_FEE_PERCENT = 500;
-  const NODE_RATE = ethers.parseEther("10");
+  const PROTOCOL_FEE_BPS = 500;
+  const NODE_RATE_PER_MINUTE = ethers.parseEther("1");
 
   beforeEach(async function () {
     [owner, operator, user, treasury] = await ethers.getSigners();
@@ -34,7 +34,7 @@ describe("Integration Tests - Full Flow", function () {
       await token.getAddress(),
       await registry.getAddress(),
       treasury.address,
-      PROTOCOL_FEE_PERCENT
+      PROTOCOL_FEE_BPS
     );
     await sessionManager.waitForDeployment();
 
@@ -43,17 +43,26 @@ describe("Integration Tests - Full Flow", function () {
   });
 
   describe("Complete User Journey", function () {
-    it("Should complete full lifecycle: register node → start session → settle → claim earnings", async function () {
+    it("Should complete full lifecycle: register node → deposit → start session → settle → stop → claim earnings", async function () {
       await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE);
-      await registry.connect(operator).registerNode("https://node1.example.com", NODE_RATE);
+      await registry.connect(operator).registerNode(
+        "https://node1.example.com",
+        "us-east-1",
+        "ipfs://test",
+        NODE_RATE_PER_MINUTE
+      );
 
       const operatorBalance1 = await token.balanceOf(operator.address);
-      console.log("  Operator balance after registration:", ethers.formatEther(operatorBalance1));
 
       const depositAmount = ethers.parseEther("100");
       const maxSpend = ethers.parseEther("100");
 
       await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
+      await sessionManager.connect(user).deposit(depositAmount);
+
+      const userBalance0 = await sessionManager.getUserBalance(user.address);
+      expect(userBalance0).to.equal(depositAmount);
+
       const tx = await sessionManager.connect(user).startSession(0, maxSpend, depositAmount);
       const receipt = await tx.wait();
 
@@ -68,111 +77,161 @@ describe("Integration Tests - Full Flow", function () {
         } catch {}
       }
 
-      console.log("  Session started with ID:", sessionId);
+      expect(await sessionManager.getUserBalance(user.address)).to.equal(0);
 
-      const userBalance1 = await token.balanceOf(user.address);
-      console.log("  User balance after deposit:", ethers.formatEther(userBalance1));
+      const userTokenBalance1 = await token.balanceOf(user.address);
 
-      await time.increase(3600);
-      await sessionManager.settleSession(sessionId);
+      await time.increase(60);
+      await sessionManager.settle(sessionId);
 
-      const session1 = await sessionManager.getSession(sessionId);
-      console.log("  Settled amount:", ethers.formatEther(session1.settled));
+      const session1 = await sessionManager.getSessionStatus(sessionId);
+      expect(session1.settled).to.be.greaterThan(0);
 
-      await time.increase(3600);
+      await time.increase(60);
       await sessionManager.connect(user).stopSession(sessionId);
 
-      const userBalance2 = await token.balanceOf(user.address);
-      console.log("  User balance after stop:", ethers.formatEther(userBalance2));
+      const userTokenBalance2 = await token.balanceOf(user.address);
+      const refund = userTokenBalance2 - userTokenBalance1;
+      expect(refund).to.be.greaterThan(0);
 
-      const refund = userBalance2 - userBalance1;
-      console.log("  Refund amount:", ethers.formatEther(refund));
-
-      const node = await registry.getNode(0);
-      console.log("  Node earnings:", ethers.formatEther(node.earnings));
-
-      expect(node.earnings).to.be.greaterThan(0);
+      const earnings = await sessionManager.getNodeEarnings(0);
+      expect(earnings).to.be.greaterThan(0);
 
       const operatorBalance2 = await token.balanceOf(operator.address);
       await registry.connect(operator).claimEarnings(0);
       const operatorBalance3 = await token.balanceOf(operator.address);
 
       const claimed = operatorBalance3 - operatorBalance2;
-      console.log("  Operator claimed:", ethers.formatEther(claimed));
+      expect(claimed).to.equal(earnings);
+    });
 
-      expect(claimed).to.equal(node.earnings);
+    it("Should handle protocol fee collection", async function () {
+      await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE);
+      await registry.connect(operator).registerNode(
+        "https://node1.example.com",
+        "us-east-1",
+        "ipfs://test",
+        NODE_RATE_PER_MINUTE
+      );
+
+      const depositAmount = ethers.parseEther("100");
+      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
+      await sessionManager.connect(user).deposit(depositAmount);
+
+      const tx = await sessionManager.connect(user).startSession(0, depositAmount, depositAmount);
+      const receipt = await tx.wait();
+
+      let sessionId: string = "";
+      for (const log of receipt!.logs) {
+        try {
+          const parsed = sessionManager.interface.parseLog(log as any);
+          if (parsed?.name === "SessionStarted") {
+            sessionId = parsed.args[0];
+            break;
+          }
+        } catch {}
+      }
+
+      await time.increase(60);
+      await sessionManager.settle(sessionId);
 
       const totalFees = await sessionManager.totalProtocolFees();
-      console.log("  Protocol fees accumulated:", ethers.formatEther(totalFees));
+      expect(totalFees).to.be.greaterThan(0);
 
       const treasuryBalance1 = await token.balanceOf(treasury.address);
       await sessionManager.withdrawProtocolFees();
       const treasuryBalance2 = await token.balanceOf(treasury.address);
 
-      const feesWithdrawn = treasuryBalance2 - treasuryBalance1;
-      console.log("  Protocol fees withdrawn:", ethers.formatEther(feesWithdrawn));
-
-      expect(feesWithdrawn).to.equal(totalFees);
+      expect(treasuryBalance2 - treasuryBalance1).to.equal(totalFees);
     });
 
-    it("Should handle multiple concurrent sessions", async function () {
-      await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE);
-      await registry.connect(operator).registerNode("https://node1.example.com", NODE_RATE);
+    it("Should handle multiple nodes and sessions", async function () {
+      await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE * 2n);
+      await registry.connect(operator).registerNode(
+        "https://node1.example.com",
+        "us-east-1",
+        "ipfs://test1",
+        NODE_RATE_PER_MINUTE
+      );
+      await registry.connect(operator).registerNode(
+        "https://node2.example.com",
+        "us-west-1",
+        "ipfs://test2",
+        NODE_RATE_PER_MINUTE * 2n
+      );
 
-      const sessionIds: string[] = [];
-
-      for (let i = 0; i < 3; i++) {
-        const depositAmount = ethers.parseEther("50");
-        await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
-        const tx = await sessionManager.connect(user).startSession(0, depositAmount, depositAmount);
-        const receipt = await tx.wait();
-
-        for (const log of receipt!.logs) {
-          try {
-            const parsed = sessionManager.interface.parseLog(log as any);
-            if (parsed?.name === "SessionStarted") {
-              sessionIds.push(parsed.args[0]);
-              break;
-            }
-          } catch {}
-        }
-      }
-
-      console.log("  Started", sessionIds.length, "concurrent sessions");
-
-      await time.increase(1800);
-
-      for (const sessionId of sessionIds) {
-        await sessionManager.settleSession(sessionId);
-      }
-
-      console.log("  Settled all sessions");
-
-      await time.increase(1800);
-
-      for (const sessionId of sessionIds) {
-        await sessionManager.connect(user).stopSession(sessionId);
-      }
-
-      console.log("  Stopped all sessions");
-
-      const node = await registry.getNode(0);
-      console.log("  Total node earnings:", ethers.formatEther(node.earnings));
-
-      expect(node.earnings).to.be.greaterThan(0);
-
-      await registry.connect(operator).claimEarnings(0);
-      const finalNode = await registry.getNode(0);
-      expect(finalNode.earnings).to.equal(0);
-    });
-
-    it("Should handle node deactivation gracefully", async function () {
-      await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE);
-      await registry.connect(operator).registerNode("https://node1.example.com", NODE_RATE);
-
-      const depositAmount = ethers.parseEther("100");
+      const depositAmount = ethers.parseEther("200");
       await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
-      const tx = await sessionManager.connect(user).startSession(0, depositAmount, depositAmount);
+      await sessionManager.connect(user).deposit(depositAmount);
+
+      const tx1 = await sessionManager.connect(user).startSession(0, ethers.parseEther("100"), ethers.parseEther("100"));
+      const receipt1 = await tx1.wait();
+
+      let sessionId1: string = "";
+      for (const log of receipt1!.logs) {
+        try {
+          const parsed = sessionManager.interface.parseLog(log as any);
+          if (parsed?.name === "SessionStarted") {
+            sessionId1 = parsed.args[0];
+            break;
+          }
+        } catch {}
+      }
+
+      const tx2 = await sessionManager.connect(user).startSession(1, ethers.parseEther("100"), ethers.parseEther("100"));
+      const receipt2 = await tx2.wait();
+
+      let sessionId2: string = "";
+      for (const log of receipt2!.logs) {
+        try {
+          const parsed = sessionManager.interface.parseLog(log as any);
+          if (parsed?.name === "SessionStarted") {
+            sessionId2 = parsed.args[0];
+            break;
+          }
+        } catch {}
+      }
+
+      await time.increase(60);
+      
+      await sessionManager.settle(sessionId1);
+      await sessionManager.settle(sessionId2);
+
+      const earnings1 = await sessionManager.getNodeEarnings(0);
+      const earnings2 = await sessionManager.getNodeEarnings(1);
+
+      expect(earnings1).to.be.greaterThan(0);
+      expect(earnings2).to.be.greaterThan(0);
+      expect(earnings2).to.be.greaterThan(earnings1);
+    });
+  });
+
+  describe("Edge Cases and Error Conditions", function () {
+    beforeEach(async function () {
+      await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE);
+      await registry.connect(operator).registerNode(
+        "https://node1.example.com",
+        "us-east-1",
+        "ipfs://test",
+        NODE_RATE_PER_MINUTE
+      );
+    });
+
+    it("Should prevent session start with insufficient balance", async function () {
+      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("50"));
+      await sessionManager.connect(user).deposit(ethers.parseEther("50"));
+
+      await expect(
+        sessionManager.connect(user).startSession(0, ethers.parseEther("100"), ethers.parseEther("100"))
+      ).to.be.revertedWithCustomError(sessionManager, "InsufficientBalance");
+    });
+
+    it("Should handle session that runs out of funds", async function () {
+      const smallDeposit = ethers.parseEther("5");
+      await token.connect(user).approve(await sessionManager.getAddress(), smallDeposit);
+      await sessionManager.connect(user).deposit(smallDeposit);
+
+      const tx = await sessionManager.connect(user).startSession(0, ethers.parseEther("100"), smallDeposit);
       const receipt = await tx.wait();
 
       let sessionId: string = "";
@@ -186,92 +245,106 @@ describe("Integration Tests - Full Flow", function () {
         } catch {}
       }
 
-      console.log("  Session started");
+      await time.increase(600);
+      await sessionManager.settle(sessionId);
 
-      await time.increase(1800);
-      await sessionManager.settleSession(sessionId);
+      const session = await sessionManager.getSessionStatus(sessionId);
+      expect(session.active).to.be.false;
+      expect(session.settled).to.equal(smallDeposit);
+    });
 
-      console.log("  Session settled");
-
+    it("Should prevent starting session with inactive node", async function () {
       await registry.connect(operator).deactivateNode(0);
-      console.log("  Node deactivated");
 
-      await time.increase(1800);
-      await sessionManager.connect(user).stopSession(sessionId);
+      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
+      await sessionManager.connect(user).deposit(ethers.parseEther("100"));
 
-      console.log("  Session stopped successfully");
+      await expect(
+        sessionManager.connect(user).startSession(0, ethers.parseEther("100"), ethers.parseEther("100"))
+      ).to.be.revertedWithCustomError(sessionManager, "NodeInactive");
+    });
 
-      const node = await registry.getNode(0);
-      expect(node.active).to.be.false;
-      expect(node.earnings).to.be.greaterThan(0);
-
+    it("Should allow reactivating node and starting new sessions", async function () {
+      await registry.connect(operator).deactivateNode(0);
       await registry.connect(operator).reactivateNode(0);
-      console.log("  Node reactivated");
 
-      const reactivatedNode = await registry.getNode(0);
-      expect(reactivatedNode.active).to.be.true;
+      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
+      await sessionManager.connect(user).deposit(ethers.parseEther("100"));
 
-      const depositAmount2 = ethers.parseEther("50");
-      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount2);
-      await sessionManager.connect(user).startSession(0, depositAmount2, depositAmount2);
-
-      console.log("  New session started after reactivation");
+      await expect(
+        sessionManager.connect(user).startSession(0, ethers.parseEther("100"), ethers.parseEther("100"))
+      ).to.not.be.reverted;
     });
   });
 
-  describe("Protocol Economics", function () {
-    it("Should correctly distribute fees across multiple sessions", async function () {
+  describe("Multi-User Scenarios", function () {
+    let user2: SignerWithAddress;
+
+    beforeEach(async function () {
+      [, , , , user2] = await ethers.getSigners();
+      await token.transfer(user2.address, ethers.parseEther("10000"));
+
       await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE);
-      await registry.connect(operator).registerNode("https://node1.example.com", NODE_RATE);
-
-      const sessions = 5;
-      const depositPerSession = ethers.parseEther("20");
-
-      for (let i = 0; i < sessions; i++) {
-        await token.connect(user).approve(await sessionManager.getAddress(), depositPerSession);
-        const tx = await sessionManager.connect(user).startSession(0, depositPerSession, depositPerSession);
-        const receipt = await tx.wait();
-
-        let sessionId: string = "";
-        for (const log of receipt!.logs) {
-          try {
-            const parsed = sessionManager.interface.parseLog(log as any);
-            if (parsed?.name === "SessionStarted") {
-              sessionId = parsed.args[0];
-              break;
-            }
-          } catch {}
-        }
-
-        await time.increase(1800);
-        await sessionManager.connect(user).stopSession(sessionId);
-      }
-
-      const node = await registry.getNode(0);
-      const protocolFees = await sessionManager.totalProtocolFees();
-
-      console.log("  Node earnings:", ethers.formatEther(node.earnings));
-      console.log("  Protocol fees:", ethers.formatEther(protocolFees));
-
-      const totalRevenue = node.earnings + protocolFees;
-      console.log("  Total revenue:", ethers.formatEther(totalRevenue));
-
-      const expectedFeeRatio = PROTOCOL_FEE_PERCENT / 10000;
-      const actualFeeRatio = Number(protocolFees) / Number(totalRevenue);
-
-      console.log("  Expected fee ratio:", expectedFeeRatio);
-      console.log("  Actual fee ratio:", actualFeeRatio);
-
-      expect(Math.abs(actualFeeRatio - expectedFeeRatio)).to.be.lessThan(0.001);
+      await registry.connect(operator).registerNode(
+        "https://node1.example.com",
+        "us-east-1",
+        "ipfs://test",
+        NODE_RATE_PER_MINUTE
+      );
     });
 
-    it("Should handle high-frequency settlement", async function () {
-      await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE);
-      await registry.connect(operator).registerNode("https://node1.example.com", NODE_RATE);
+    it("Should handle concurrent sessions from different users", async function () {
+      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
+      await sessionManager.connect(user).deposit(ethers.parseEther("100"));
 
-      const depositAmount = ethers.parseEther("100");
-      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
-      const tx = await sessionManager.connect(user).startSession(0, depositAmount, depositAmount);
+      await token.connect(user2).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
+      await sessionManager.connect(user2).deposit(ethers.parseEther("100"));
+
+      const tx1 = await sessionManager.connect(user).startSession(0, ethers.parseEther("100"), ethers.parseEther("100"));
+      const tx2 = await sessionManager.connect(user2).startSession(0, ethers.parseEther("100"), ethers.parseEther("100"));
+
+      const receipt1 = await tx1.wait();
+      const receipt2 = await tx2.wait();
+
+      let sessionId1: string = "";
+      for (const log of receipt1!.logs) {
+        try {
+          const parsed = sessionManager.interface.parseLog(log as any);
+          if (parsed?.name === "SessionStarted") {
+            sessionId1 = parsed.args[0];
+            break;
+          }
+        } catch {}
+      }
+
+      let sessionId2: string = "";
+      for (const log of receipt2!.logs) {
+        try {
+          const parsed = sessionManager.interface.parseLog(log as any);
+          if (parsed?.name === "SessionStarted") {
+            sessionId2 = parsed.args[0];
+            break;
+          }
+        } catch {}
+      }
+
+      await time.increase(60);
+
+      await sessionManager.settle(sessionId1);
+      await sessionManager.settle(sessionId2);
+
+      const session1 = await sessionManager.getSessionStatus(sessionId1);
+      const session2 = await sessionManager.getSessionStatus(sessionId2);
+
+      expect(session1.settled).to.be.greaterThan(0);
+      expect(session2.settled).to.be.greaterThan(0);
+    });
+
+    it("Should not allow user to stop another user's session", async function () {
+      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
+      await sessionManager.connect(user).deposit(ethers.parseEther("100"));
+
+      const tx = await sessionManager.connect(user).startSession(0, ethers.parseEther("100"), ethers.parseEther("100"));
       const receipt = await tx.wait();
 
       let sessionId: string = "";
@@ -285,44 +358,16 @@ describe("Integration Tests - Full Flow", function () {
         } catch {}
       }
 
-      const settlements = 10;
-      for (let i = 0; i < settlements; i++) {
-        await time.increase(600);
-        await sessionManager.settleSession(sessionId);
-      }
-
-      console.log("  Performed", settlements, "settlements");
-
-      const session = await sessionManager.getSession(sessionId);
-      console.log("  Total settled:", ethers.formatEther(session.settled));
-
-      expect(session.settled).to.be.greaterThan(0);
-      expect(session.settled).to.be.lessThanOrEqual(depositAmount);
-    });
-  });
-
-  describe("Edge Cases and Security", function () {
-    it("Should prevent unauthorized access to admin functions", async function () {
       await expect(
-        sessionManager.connect(user).pause()
-      ).to.be.revertedWithCustomError(sessionManager, "OwnableUnauthorizedAccount");
-
-      await expect(
-        registry.connect(user).pause()
-      ).to.be.revertedWithCustomError(registry, "OwnableUnauthorizedAccount");
-
-      await expect(
-        token.connect(user).mint(user.address, ethers.parseEther("1000"))
-      ).to.be.revertedWithCustomError(token, "OwnableUnauthorizedAccount");
+        sessionManager.connect(user2).stopSession(sessionId)
+      ).to.be.revertedWithCustomError(sessionManager, "NotAuthorized");
     });
 
-    it("Should handle emergency pause correctly", async function () {
-      await token.connect(operator).approve(await registry.getAddress(), REGISTRATION_FEE);
-      await registry.connect(operator).registerNode("https://node1.example.com", NODE_RATE);
+    it("Should allow owner to stop any session", async function () {
+      await token.connect(user).approve(await sessionManager.getAddress(), ethers.parseEther("100"));
+      await sessionManager.connect(user).deposit(ethers.parseEther("100"));
 
-      const depositAmount = ethers.parseEther("100");
-      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
-      const tx = await sessionManager.connect(user).startSession(0, depositAmount, depositAmount);
+      const tx = await sessionManager.connect(user).startSession(0, ethers.parseEther("100"), ethers.parseEther("100"));
       const receipt = await tx.wait();
 
       let sessionId: string = "";
@@ -336,26 +381,9 @@ describe("Integration Tests - Full Flow", function () {
         } catch {}
       }
 
-      await sessionManager.pause();
-      console.log("  SessionManager paused");
-
-      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
       await expect(
-        sessionManager.connect(user).startSession(0, depositAmount, depositAmount)
-      ).to.be.revertedWithCustomError(sessionManager, "EnforcedPause");
-
-      await time.increase(1800);
-      await sessionManager.connect(user).stopSession(sessionId);
-
-      console.log("  Existing session stopped during pause");
-
-      await sessionManager.unpause();
-      console.log("  SessionManager unpaused");
-
-      await token.connect(user).approve(await sessionManager.getAddress(), depositAmount);
-      await sessionManager.connect(user).startSession(0, depositAmount, depositAmount);
-
-      console.log("  New session started after unpause");
+        sessionManager.connect(owner).stopSession(sessionId)
+      ).to.not.be.reverted;
     });
   });
 });

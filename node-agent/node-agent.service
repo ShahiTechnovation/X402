@@ -1,0 +1,52 @@
+[Unit]
+Description=X402 Node Agent
+Documentation=https://github.com/x402/node-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nodeagent
+Group=nodeagent
+WorkingDirectory=/opt/x402/node-agent
+ExecStart=/opt/x402/node-agent/node-agent
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Environment variables
+EnvironmentFile=/opt/x402/node-agent/.env
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/x402/node-agent/logs /var/run/wireguard
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+# Capabilities
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=node-agent
+
+# Health checks
+ExecStartPre=/usr/bin/test -f /opt/x402/node-agent/node-agent
+ExecStartPre=/usr/bin/test -f /opt/x402/node-agent/.env
+
+[Install]
+WantedBy=multi-user.target

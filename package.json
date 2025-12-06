@@ -13,7 +13,8 @@
     "verify:baseSepolia": "hardhat run scripts/verify.ts --network baseSepolia",
     "node": "hardhat node",
     "clean": "hardhat clean",
-    "typechain": "hardhat typechain"
+    "typechain": "hardhat typechain",
+    "e2e:local": "hardhat run scripts/e2e-scenario.ts --network hardhat"
   },
   "repository": {
     "type": "git",

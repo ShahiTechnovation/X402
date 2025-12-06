@@ -1,0 +1,56 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Hardhat
+cache/
+artifacts/
+typechain-types/
+
+# Coverage
+coverage/
+coverage.json
+.coverage_artifacts
+.coverage_cache
+.coverage_contracts
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test outputs
+test-results/
+junit.xml
+
+# Gas reports
+gas-report.txt
+gas-report.json
+
+# Deployment artifacts (keep base_sepolia.json template)
+deployments/*.json
+!deployments/.gitkeep
